@@ -13,6 +13,11 @@ Key guarantees implemented here:
   results never come back as current, and devices not involved keep serving.
 * Undeterminable intervals are stored with ``energy_kwh = NULL``; zero is
   only ever written for a genuinely measured zero difference.
+* Cross-device meter conflicts (the same meter occupied by two devices) are
+  derived from the committed current revisions in :mod:`app.audit`.  An
+  interval overlapping such a conflict is stored as ``conflict`` and is never
+  eligible to supply current energy; accepting a correction changes that
+  conclusion immediately, independent of any rebuild or restart.
 """
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ import sqlite3
 
 from .errors import ConflictError, RebuildFailure
 from .models import HandoverIn, ReadingIn, to_utc_iso, utc_now_iso
+from . import audit
 
 
 def _hash(payload: dict) -> str:
@@ -84,16 +90,44 @@ def _check_revision(
 
 
 def _stale_current_intervals(conn: sqlite3.Connection, device_ids: list[str]) -> int:
-    """Immediately revoke current-supply eligibility on affected devices."""
+    """Immediately revoke current-supply eligibility on affected devices.
+
+    Rows already marked as conflicting also lose that state: their conclusion
+    must be recomputed from the newly committed data, never inherited.
+    """
     if not device_ids:
         return 0
     placeholders = ",".join("?" for _ in device_ids)
     cur = conn.execute(
         f"UPDATE intervals SET status = 'stale', "
-        f"superseded_at = ? WHERE status = 'current' AND device_id IN ({placeholders})",
+        f"superseded_at = ? WHERE status IN ('current','conflict') "
+        f"AND device_id IN ({placeholders})",
         [utc_now_iso(), *device_ids],
     )
     return cur.rowcount
+
+
+def _conflict_map(conn: sqlite3.Connection) -> dict[str, frozenset]:
+    return audit.conflicts_by_device(audit.find_conflicts(audit.build_audit_data(conn)))
+
+
+def _moved_source_devices(
+    conn: sqlite3.Connection, table: str, source_id: str, current_device: str
+) -> set[str]:
+    """Other devices that a source used to (or still does) belong to.
+
+    Revisions of one source may name different devices over time; a change
+    must revoke the intervals of the device the earlier revision pointed at,
+    even when the same transaction also moves the source forward.
+    """
+    return {
+        r["device_id"]
+        for r in conn.execute(
+            f"SELECT DISTINCT device_id FROM {table} WHERE source_id = ? "
+            f"AND device_id <> ?",
+            (source_id, current_device),
+        )
+    }
 
 
 def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
@@ -111,6 +145,7 @@ def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
     try:
         idempotent = _check_revision(conn, "readings", payload.source_id, payload.revision, digest)
         if not idempotent:
+            before = _conflict_map(conn)
             conn.execute(
                 "INSERT INTO readings (source_id, revision, device_id, ts, meter_no, "
                 "cumulative, content_hash) VALUES (?,?,?,?,?,?,?)",
@@ -132,6 +167,16 @@ def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            moved = _moved_source_devices(conn, "readings", payload.source_id, payload.device_id)
+            # A newly introduced / resolved cross-device conflict changes the
+            # eligibility of every device involved, even one whose own readings
+            # did not move.  Their intervals are revoked in this transaction so
+            # no stale conclusion can be served in the meantime.
+            after = _conflict_map(conn)
+            changed = audit.changed_conflict_devices(before, after) - set(affected) - moved
+            if changed:
+                _stale_current_intervals(conn, sorted(changed))
+            affected = sorted(devices | changed | moved)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -163,6 +208,7 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
     try:
         idempotent = _check_revision(conn, "handovers", payload.source_id, payload.revision, digest)
         if not idempotent:
+            before = _conflict_map(conn)
             conn.execute(
                 "INSERT INTO handovers (source_id, revision, device_id, ts, old_meter_no, "
                 "old_final, new_meter_no, new_initial, content_hash) "
@@ -183,6 +229,15 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            moved = _moved_source_devices(conn, "readings", payload.source_id, payload.device_id)
+            # A handover decides how a cross-meter segment is split, so it can
+            # create or remove a cross-device occupancy overlap on other
+            # devices as well.
+            after = _conflict_map(conn)
+            changed = audit.changed_conflict_devices(before, after) - set(affected) - moved
+            if changed:
+                _stale_current_intervals(conn, sorted(changed))
+            affected = sorted(devices | changed | moved)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -202,25 +257,33 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
 # ---------------------------------------------------------------------------
 
 def _latest_readings(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.Row]:
-    """Authoritative readings: highest revision of every source of a device."""
+    """Authoritative readings of a device.
+
+    The highest revision of every ``source_id`` is resolved *globally* first
+    and only then filtered by device: a correction that moves a source to a
+    different device must remove it from the old device instead of leaving the
+    superseded revision behind.
+    """
     return conn.execute(
         "WITH latest AS ("
-        "  SELECT source_id, MAX(revision) AS max_rev FROM readings "
-        "  WHERE device_id = ? GROUP BY source_id"
+        "  SELECT source_id, MAX(revision) AS max_rev FROM readings GROUP BY source_id"
         ") SELECT r.* FROM readings r JOIN latest l "
         "ON r.source_id = l.source_id AND r.revision = l.max_rev "
+        "WHERE r.device_id = ? "
         "ORDER BY r.ts ASC, r.id ASC",
         (device_id,),
     ).fetchall()
 
 
 def _latest_handovers(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.Row]:
+    """Authoritative handovers of a device (current revision per source)."""
     return conn.execute(
         "WITH latest AS ("
-        "  SELECT source_id, MAX(revision) AS max_rev FROM handovers "
-        "  WHERE device_id = ? GROUP BY source_id"
+        "  SELECT source_id, MAX(revision) AS max_rev FROM handovers GROUP BY source_id"
         ") SELECT h.* FROM handovers h JOIN latest l "
-        "ON h.source_id = l.source_id AND h.revision = l.max_rev",
+        "ON h.source_id = l.source_id AND h.revision = l.max_rev "
+        "WHERE h.device_id = ? "
+        "ORDER BY h.ts ASC, h.id ASC",
         (device_id,),
     ).fetchall()
 
@@ -230,6 +293,8 @@ def _settle_interval(
     device_id: str,
     a: sqlite3.Row,
     b: sqlite3.Row,
+    conflicts: list[audit.Conflict] | None = None,
+    handovers: list[sqlite3.Row] | None = None,
 ) -> dict:
     """Compute the consumption between two adjacent readings.
 
@@ -238,6 +303,9 @@ def _settle_interval(
     Cross meter -> only settle when exactly one handover of this device falls
                    strictly inside the interval and its meter numbers match
                    both ends; otherwise undeterminable ('handover missing').
+    Either way, if the interval overlaps a cross-device meter conflict the
+    energy is undeterminable ('meter_conflict') and carries the conflict
+    detail: such a row may never supply current energy.
     """
     common = {
         "device_id": device_id,
@@ -246,7 +314,21 @@ def _settle_interval(
         "start_source_id": a["source_id"], "start_revision": a["revision"],
         "end_source_id": b["source_id"], "end_revision": b["revision"],
         "handover_source_id": None, "handover_revision": None,
+        "conflict": 0, "conflict_detail": None,
     }
+
+    hits = audit.conflicts_for_interval(
+        a["ts"], b["ts"], {a["meter_no"], b["meter_no"]}, conflicts or []
+    )
+    if hits:
+        return {
+            **common,
+            "energy_kwh": None,
+            "conflict": 1,
+            "conflict_detail": audit.conflict_detail(hits),
+            "reason": "meter_conflict: interval overlaps a cross-device meter "
+                      "registration conflict; not eligible for current supply",
+        }
 
     if a["meter_no"] == b["meter_no"]:
         diff = b["cumulative"] - a["cumulative"]
@@ -255,21 +337,18 @@ def _settle_interval(
                     "reason": "negative_difference: meter reading went backward"}
         return {**common, "energy_kwh": round(diff, 9), "reason": None}
 
-    # Cross-meter interval: look for the unique matching handover inside it.
-    matches = conn.execute(
-        "SELECT * FROM handovers WHERE device_id = ? AND ts > ? AND ts < ? "
-        "AND old_meter_no = ? AND new_meter_no = ? "
-        "AND source_id IN (SELECT source_id FROM handovers WHERE device_id = ?) "
-        "ORDER BY id",
-        (device_id, a["ts"], b["ts"], a["meter_no"], b["meter_no"], device_id),
-    ).fetchall()
-    # Keep only the latest revision per handover source.
-    latest: dict[str, sqlite3.Row] = {}
-    for h in matches:
-        cur = latest.get(h["source_id"])
-        if cur is None or h["revision"] > cur["revision"]:
-            latest[h["source_id"]] = h
-    unique = list(latest.values())
+    # Cross-meter interval: look for the unique matching handover inside it,
+    # considering only the current revision of every handover source.
+    if handovers is None:
+        handovers = _latest_handovers(conn, device_id)
+    unique = [
+        h
+        for h in handovers
+        if h["ts"] > a["ts"]
+        and h["ts"] < b["ts"]
+        and h["old_meter_no"] == a["meter_no"]
+        and h["new_meter_no"] == b["meter_no"]
+    ]
 
     if len(unique) == 0:
         return {**common, "energy_kwh": None,
@@ -295,10 +374,16 @@ def _settle_interval(
 
 
 def devices_with_stale_intervals(conn: sqlite3.Connection) -> list[str]:
+    """Devices holding intervals that lost current eligibility.
+
+    Includes ``conflict`` rows: they are not current energy either, and a
+    retry must recompute them from the committed data.
+    """
     return [
         r["device_id"]
         for r in conn.execute(
-            "SELECT DISTINCT device_id FROM intervals WHERE status = 'stale' ORDER BY 1"
+            "SELECT DISTINCT device_id FROM intervals "
+            "WHERE status IN ('stale','conflict') ORDER BY 1"
         )
     ]
 
@@ -338,16 +423,22 @@ def rebuild_device(
         readings = _latest_readings(conn, device_id)
         # Touch the handover table so its latest revisions are considered even
         # when no cross-meter interval exists yet.
-        _latest_handovers(conn, device_id)
+        handovers = _latest_handovers(conn, device_id)
+        # Conflict conclusions are always derived from committed readings /
+        # handovers inside this same transaction, so a concurrent submission
+        # can never be half-observed.
+        conflicts = audit.find_conflicts(audit.build_audit_data(conn))
 
         rows = [
-            _settle_interval(conn, device_id, readings[i], readings[i + 1])
+            _settle_interval(
+                conn, device_id, readings[i], readings[i + 1], conflicts, handovers
+            )
             for i in range(len(readings) - 1)
         ]
 
-        # Stale rows stay as an audit trail; only current rows are replaced.
+        # Stale rows stay as an audit trail; only live rows are replaced.
         conn.execute(
-            "DELETE FROM intervals WHERE device_id = ? AND status = 'current'",
+            "DELETE FROM intervals WHERE device_id = ? AND status IN ('current','conflict')",
             (device_id,),
         )
         for r in rows:
@@ -355,13 +446,16 @@ def rebuild_device(
                 "INSERT INTO intervals (device_id, start_ts, end_ts, start_meter_no, "
                 "end_meter_no, energy_kwh, status, reason, start_source_id, "
                 "start_revision, end_source_id, end_revision, handover_source_id, "
-                "handover_revision) VALUES (?,?,?,?,?,?,'current',?,?,?,?,?,?,?)",
+                "handover_revision, conflict, conflict_detail) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     r["device_id"], r["start_ts"], r["end_ts"],
-                    r["start_meter_no"], r["end_meter_no"], r["energy_kwh"], r["reason"],
+                    r["start_meter_no"], r["end_meter_no"], r["energy_kwh"],
+                    "conflict" if r["conflict"] else "current", r["reason"],
                     r["start_source_id"], r["start_revision"],
                     r["end_source_id"], r["end_revision"],
                     r["handover_source_id"], r["handover_revision"],
+                    r["conflict"], r["conflict_detail"],
                 ),
             )
         conn.execute(
@@ -458,17 +552,78 @@ def list_intervals(
     conn: sqlite3.Connection,
     device_id: str | None,
     status: str,
-) -> list[sqlite3.Row]:
+) -> list[dict]:
+    """List intervals with conflict eligibility derived from committed data.
+
+    The stored status is authoritative for ``stale``/``conflict`` rows, but a
+    row is *also* checked against a live audit of the committed readings and
+    handovers.  An interval overlapping a cross-device meter conflict is never
+    served as current energy, even if a rebuild has not run since the conflict
+    appeared (for example a conflict introduced outside a rebuild, or a
+    database upgraded from an older schema).
+    """
     clauses: list[str] = []
     params: list[str] = []
-    if status != "all":
+    if status == "current":
+        clauses.append("status = 'current'")
+    elif status == "conflict":
+        clauses.append("status = 'conflict'")
+    elif status != "all":
         clauses.append("status = ?")
         params.append(status)
     if device_id is not None:
         clauses.append("device_id = ?")
         params.append(device_id)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    return conn.execute(
+    rows = conn.execute(
         f"SELECT * FROM intervals{where} ORDER BY device_id, start_ts, id",
         params,
     ).fetchall()
+
+    conflicts = audit.find_conflicts(audit.build_audit_data(conn))
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        hits = audit.conflicts_for_interval(
+            r["start_ts"], r["end_ts"],
+            {r["start_meter_no"], r["end_meter_no"]}, conflicts,
+        )
+        if hits:
+            d["conflict"] = 1
+            d["conflict_detail"] = audit.conflict_detail(hits)
+            if d["status"] == "current":
+                if status == "current":
+                    # Never supply current energy for a conflicting interval.
+                    continue
+                # The stored row predates the conflict (e.g. a conflict that
+                # appeared without a rebuild, or a database upgraded from the
+                # old schema).  Report it as gated, never as energy.
+                d["status"] = "conflict"
+                d["energy_kwh"] = None
+                d["reason"] = (
+                    "meter_conflict: interval overlaps a cross-device meter "
+                    "registration conflict; not eligible for current supply"
+                )
+            # Stale rows keep their own historical conclusion untouched.
+        elif d["status"] == "conflict":
+            if status == "conflict":
+                # Stored conclusion no longer matches committed data; keep it
+                # out until a rebuild recomputes the row.
+                continue
+            if status == "all":
+                # Keep audit history truthful: an interval marked conflicting
+                # by an earlier rebuild is not a current-energy row.  Its
+                # eligibility is re-established only by a successful rebuild.
+                d["status"] = "stale"
+        out.append(d)
+    return out
+
+
+def meter_audit(
+    conn: sqlite3.Connection,
+    meter_no: str,
+    from_ts: str,
+    to_ts: str,
+) -> dict:
+    """Meter conflict audit over committed data (see :mod:`app.audit`)."""
+    return audit.meter_audit(conn, meter_no, from_ts, to_ts)

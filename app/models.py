@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now_iso() -> str:
@@ -89,6 +90,8 @@ class IntervalOut(BaseModel):
     end_revision: int
     handover_source_id: str | None
     handover_revision: int | None
+    conflict: bool
+    conflict_detail: str | None
 
 
 class RebuildOut(BaseModel):
@@ -97,3 +100,125 @@ class RebuildOut(BaseModel):
     rebuilt_devices: list[str]
     failed_devices: dict[str, str]
     detail: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Meter conflict audit (/meter-audit)
+# ---------------------------------------------------------------------------
+
+class ProvenanceOut(BaseModel):
+    """A pointer to the authoritative reading/handover bounding a segment."""
+
+    kind: Literal["reading", "handover"]
+    source_id: str
+    revision: int
+    ts: str
+
+
+class ReadingSourceOut(BaseModel):
+    source_id: str
+    revision: int
+    device_id: str
+    ts: str
+    meter_no: str
+    cumulative_kwh: float
+
+
+class HandoverSourceOut(BaseModel):
+    source_id: str
+    revision: int
+    device_id: str
+    ts: str
+    old_meter_no: str
+    old_final_kwh: float
+    new_meter_no: str
+    new_initial_kwh: float
+
+
+class ConflictOccupancyOut(BaseModel):
+    """One device's occupancy segment that overlaps another device's."""
+
+    device_id: str
+    meter_no: str
+    start_ts: str
+    end_ts: str
+    start_ref: ProvenanceOut
+    end_ref: ProvenanceOut
+    handover_source_id: str | None
+    handover_revision: int | None
+
+
+class ConflictOut(BaseModel):
+    meter_no: str
+    start_ts: str
+    end_ts: str
+    devices: list[str]
+    device_ids: list[str]
+    occupancies: list[ConflictOccupancyOut]
+    readings: list[ReadingSourceOut]
+    handovers: list[HandoverSourceOut]
+    reading_sources: list[dict]
+    handover_sources: list[dict]
+
+
+class PendingOut(BaseModel):
+    """A period whose meter attribution cannot be determined."""
+
+    kind: Literal["cross_meter", "unresolved_reading", "no_data"]
+    device_id: str | None
+    meter_no: str | None
+    start_ts: str | None
+    end_ts: str | None
+    old_meter_no: str | None
+    new_meter_no: str | None
+    reason: str
+    readings: list[ReadingSourceOut]
+    sources: list[dict]
+
+
+class MeterAuditOut(BaseModel):
+    meter_no: str
+    from_ts: str
+    to_ts: str
+    status: Literal["clear", "conflict", "pending"]
+    conflict: bool = Field(description="True when status == 'conflict'")
+    has_conflict: bool
+    conflict_count: int
+    meter_known: bool
+    conflicts: list[ConflictOut]
+    conflict_periods: list[ConflictOut]
+    pending: list[PendingOut]
+    pending_reviews: list[PendingOut]
+    readings: list[ReadingSourceOut]
+    handovers: list[HandoverSourceOut]
+
+
+class MeterAuditQuery(BaseModel):
+    """Validated query parameters (UTC instants, half-open window)."""
+
+    meter_no: str = Field(min_length=1)
+    from_ts: datetime
+    to_ts: datetime
+
+    @field_validator("meter_no")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("from_ts", "to_ts")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError(
+                "timestamp must include a timezone (use UTC, e.g. 2026-01-01T00:00:00Z)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "MeterAuditQuery":
+        if self.from_ts >= self.to_ts:
+            raise ValueError("from_ts must be strictly before to_ts")
+        return self

@@ -3,6 +3,8 @@
 按设备收集累计电表读数与换表交接，按相邻读数生成带来源编号的区间电量。
 换表后新表起始值不会被算成负用电：跨表区间只有在区间内存在**唯一匹配**的
 换表交接时才分段结算，否则标记为“无法判定”（`energy_kwh = null`），绝不报零。
+`GET /meter-audit` 按表号与 UTC 时段核查同一块电表是否被重复登记到多台设备
+（串表）；冲突涉及的区间不作为现行电量供数。
 
 ## 启动（Docker Compose）
 
@@ -59,15 +61,66 @@ docker compose up --build
 | 跨表，区间内有唯一匹配交接（表号、设备、时刻均匹配） | `(旧表末值−前读数)+(后读数−新表初值)`，任一段为负 → `null` |
 | 跨表但无交接 / 交接表号不匹配 / 交接不唯一 | `null`（`handover_missing` / `ambiguous_handover`） |
 | 真实零差值 | 正常写 `0.0`，`undeterminable=false` |
+| 区间与跨设备串表冲突重叠 | `null`（`meter_conflict`），`status=conflict`，**不作为现行电量供数** |
 
-查询参数：`device_id`（可选）、`status=current|stale|all`（默认 current）。
+查询参数：`device_id`（可选）、`status=current|stale|conflict|all`（默认 current）。
+`current` 绝不会返回与串表冲突重叠的区间（即使尚未重算）；`all` 中这类行
+`conflict=true` 且带 `conflict_detail`（表号、冲突时段、涉及设备）。
+
+## 串表核查 `GET /meter-audit`
+
+按**表号**和 **UTC 时段**核查同一块电表是否被登记到多台设备：
+
+```
+GET /meter-audit?meter_no=M-100&from_ts=2026-11-01T00:00:00Z&to_ts=2026-11-02T00:00:00Z
+```
+
+（`from_ts` 含、`to_ts` 不含；`start_ts`/`end_ts` 为等价别名。时间戳必须带
+时区，否则 422。）
+
+结论 `status`：
+
+| status | 含义 |
+| --- | --- |
+| `conflict` | 存在跨设备重叠时段，`conflicts[]` 给出时段、涉及设备、占用区间与读数/交接来源 |
+| `pending` | 归属无法确定（跨表缺唯一交接、跨表交接不唯一、读数无法被本设备相邻读数界定、表号无任何已提交数据）。**绝不报 clear** |
+| `clear` | 窗口内无跨设备重叠且无待核事项 |
+
+规则：
+
+1. 只取读数/交接的**现行修订**（每个 `source_id` 的最高修订号，按来源全局解析，
+   再按设备归属）。历史修订仅供审计，不参与任何结论。
+2. **同表相邻读数**之间形成一个占用区间（`[前读数, 后读数)`）。
+3. **跨表**相邻读数只有在区间内存在**唯一**匹配交接（旧表号、新表号、时刻均匹配）
+   时才按交接时刻拆成两段占用；无交接或不唯一则整段记为 `pending`。
+4. 同一表号上不同设备的占用区间时间重叠即冲突；同一对设备的连续重叠合并为
+   一个时段。边界相切（一段结束 = 另一段开始）不算重叠。
+5. 每条冲突时段返回 `occupancies[]`（每台设备的占用区间、起止来源引用，以及
+   跨表拆分所用交接）、`readings[]`/`handovers[]`（现行修订的完整内容）与
+   `reading_sources[]`/`handover_sources[]`（来源编号+修订号）。
+
+核查过程在一个只读事务中读取**同一份已提交数据**：与更正并行时，要么看到
+更正前、要么看到更正后的完整状态，不会看到半提交。
+
+## 冲突与现行供数资格
+
+- 冲突涉及的每个区间都**不得作为现行电量供数**：重建后写为 `status=conflict`、
+  `energy_kwh=null`、`reason=meter_conflict…`。
+- 更正一经**受理**（提交事务提交）即改变核查结论；核查不依赖重建是否成功，
+  因此重建失败或服务重启都不能恢复旧结论。
+- 提交时若冲突关系发生变化（即使某设备自身读数未变，例如另一台设备被更正到
+  同一表号），该设备全部现行区间在同一事务内立即转为 `stale`，并在响应的
+  `affected_devices` 中列出。
+- 更正消除冲突后，仅当重建成功、区间本身可按原规则结算时才恢复 `current`；
+  无关设备全程照常供数。
+- 重建失败/进程崩溃/服务重启只留下 `stale`/`conflict` 行，绝不复活为 `current`。
 
 ## 迟到数据与重建的一致性保证
 
 1. 读数/交接一旦**受理**，受影响设备的全部 `current` 区间在同一事务内立即
    置为 `stale`（失去当前供数资格，仍可按 `status=stale` 审计查询）。
 2. 受理后自动按设备重建；也可 `POST /rebuild?device_id=...` 手动重试，
-   或 `POST /rebuild`（默认只重建仍有 stale 区间的设备）。
+   或 `POST /rebuild`（默认只重建仍有 stale 或 conflict 区间的设备）。
 3. 重建在单事务内完成：失败/进程崩溃时事务回滚，旧结果保持 stale，
    **不会复活为 current**；服务重启不自动重建，只把崩溃遗留的 running
    运行标记为 `interrupted`（见 `GET /rebuild-runs`）。
@@ -89,8 +142,9 @@ pytest -q
 ## 目录结构
 
 ```
-app/            FastAPI 应用（models/database/service/main）
-tests/          17 项端到端自测（TestClient + 临时 SQLite 文件）
+app/            FastAPI 应用（models/database/service/audit/main）
+    audit.py    串表占用/冲突推导（只读已提交的现行修订）
+tests/          38 项端到端自测（TestClient + 临时 SQLite 文件）
 Dockerfile      python:3.11-slim 镜像，含 /health 健康检查
 docker-compose.yml
 ```
